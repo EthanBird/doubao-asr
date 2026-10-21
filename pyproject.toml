@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doubao-asr"
+version = "1.0.0"
+description = "零第三方依赖、高性能豆包输入法长语音/音视频转文字 + LLM 智能整理 SDK（支持流式与多线程并发）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Doubao ASR Authors" }]
+# 零第三方 Python 包依赖（仅使用 Python 标准库 + 内置 opus.dll / ffmpeg 兜底）
+dependencies = []
+
+[project.scripts]
+doubao-asr = "doubao_asr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+doubao_asr = ["_bin/*.dll", "_bin/*.so*", "_bin/*.dylib"]
