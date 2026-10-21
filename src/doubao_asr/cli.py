@@ -38,8 +38,8 @@ def main():
         "-w",
         "--workers",
         type=int,
-        default=4,
-        help="并发识别线程数 (默认 4，仅在非 --stream 批量模式下生效)",
+        default=8,
+        help="并发识别线程数 (默认 8，双 AppKey 负载均衡，仅在非 --stream 批量模式下生效)",
     )
     parser.add_argument("--stream", action="store_true", help="启用协议级真流式模式（实时显示增量识别）")
     parser.add_argument("--text", default="", help="纯后处理模式：仅将该段文字交给官方 LLM「智能整理」")

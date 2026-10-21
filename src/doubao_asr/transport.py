@@ -324,8 +324,9 @@ class WSSConnectionPool:
         self._lock = threading.Lock()
 
     def acquire(self, device_id: str, token: str) -> WSSConnection:
+        pool_key = f"{device_id}:{token}"
         with self._lock:
-            bucket = self._pool.get(device_id)
+            bucket = self._pool.get(pool_key)
             while bucket:
                 conn = bucket.pop()
                 if not conn.closed:
@@ -335,12 +336,13 @@ class WSSConnectionPool:
         conn.ensure_task_started(token)
         return conn
 
-    def release(self, device_id: str, conn: WSSConnection) -> None:
+    def release(self, device_id: str, token: str, conn: WSSConnection) -> None:
         if conn.closed or not conn.task_started:
             conn.close()
             return
+        pool_key = f"{device_id}:{token}"
         with self._lock:
-            bucket = self._pool.setdefault(device_id, [])
+            bucket = self._pool.setdefault(pool_key, [])
             if len(bucket) < self.max_pool_size:
                 bucket.append(conn)
                 return
@@ -467,18 +469,21 @@ def _split_text_for_organize(text: str, max_chars: int = 450) -> List[str]:
 
 
 class DoubaoTransport:
-    """管理豆包输入法匿名设备注册、WebSocket 连接池转写与官方 LLM 智能整理"""
+    """管理豆包输入法匿名设备注册、双 AppKey 8 路 WebSocket 连接池转写与官方 LLM 智能整理"""
 
-    def __init__(self, state_path: Optional[str] = None, timeout: float = 25.0, max_concurrent_sessions: int = 4):
+    def __init__(self, state_path: Optional[str] = None, timeout: float = 25.0, max_concurrent_sessions: int = 8):
         self.state_path = state_path
         self.timeout = timeout
         self.register_pool = HTTPSConnectionPool(REGISTER_HOST, timeout=timeout, max_pool_size=4)
         self.settings_pool = HTTPSConnectionPool(SETTINGS_HOST, timeout=timeout, max_pool_size=4)
         self.organize_pool = HTTPSConnectionPool(ORGANIZE_HOST, timeout=60.0, max_pool_size=16)
         self.ws_pool = WSSConnectionPool(timeout=timeout, max_pool_size=max_concurrent_sessions)
-        self._session_sem = threading.BoundedSemaphore(max_concurrent_sessions)
+        self._sem_primary = threading.BoundedSemaphore(4)
+        self._sem_secondary = threading.BoundedSemaphore(4)
+        self._rr = 0
         self._lock = threading.RLock()
         self.device: Optional[Dict[str, Any]] = self._load_state()
+        self.secondary_device: Optional[Dict[str, Any]] = None
 
     def _load_state(self) -> Optional[Dict[str, Any]]:
         if os.environ.get("DOUBAO_DEVICE_ID"):
@@ -610,6 +615,18 @@ class DoubaoTransport:
             if self.device and not force:
                 return self.device
             return self.register_device()
+
+    def get_secondary_device(self) -> Dict[str, Any]:
+        """获取绑定备用 AppKey (OrnqKvSSrs) 的第二匿名设备，用于突破单 key 4 并发限制扩展至 8 路并发"""
+        with self._lock:
+            if self.secondary_device:
+                return self.secondary_device
+            saved_primary = self.device
+            sec = dict(self.register_device())
+            sec["token"] = APP_KEY_HARDCODED
+            self.device = saved_primary
+            self.secondary_device = sec
+            return sec
 
     def fetch_settings(self, device_id: Optional[str] = None, cdid: str = "") -> Dict[str, Any]:
         dev = self.get_device() if not device_id else {"device_id": device_id, "cdid": cdid}
@@ -769,15 +786,33 @@ class DoubaoTransport:
 
         last_err: Optional[Exception] = None
         best_partial: str = ""
-        with self._session_sem:
+
+        # 优先非阻塞获取主 Key (RTIHIRzbwS, 4路配额)；若满载则自动溢出至备用 Key (OrnqKvSSrs, 4路配额)，实现 8 路并发
+        use_secondary = False
+        acquired_sem = self._sem_primary
+        if not self._sem_primary.acquire(blocking=False):
+            if self._sem_secondary.acquire(blocking=False):
+                use_secondary = True
+                acquired_sem = self._sem_secondary
+            else:
+                with self._lock:
+                    self._rr += 1
+                    use_secondary = (self._rr & 1) == 1
+                acquired_sem = self._sem_secondary if use_secondary else self._sem_primary
+                acquired_sem.acquire()
+
+        try:
+            active_dev = self.get_secondary_device() if use_secondary else dev
             for attempt in range(5):
                 conn: Optional[WSSConnection] = None
                 finals: Dict[int, str] = {}
                 interims: Dict[int, str] = {}
                 confidences: List[float] = []
                 try:
-                    cur_token = APP_KEY_HARDCODED if attempt >= 3 else dev["token"]
+                    cur_token = APP_KEY_HARDCODED if (use_secondary or attempt >= 3) else active_dev["token"]
+                    cur_did = active_dev["device_id"]
                     cur_ext = dict(ext)
+                    cur_ext["did"] = str(cur_did)
                     if attempt >= 2:
                         cur_ext["enable_asr_threepass"] = 0
                     cur_session_payload = json.dumps(
@@ -790,7 +825,7 @@ class DoubaoTransport:
                         ensure_ascii=False,
                     )
 
-                    conn = self.ws_pool.acquire(dev["device_id"], cur_token)
+                    conn = self.ws_pool.acquire(cur_did, cur_token)
                     rid = str(uuid.uuid4())
                     conn.send_binary(
                         build_request(
@@ -803,7 +838,7 @@ class DoubaoTransport:
                     r = parse_response(conn.recv_message(timeout=10.0))
                     if r["message_type"] in ("SessionFailed", "TaskFailed"):
                         if r["status_code"] == 40200011 and r["message_type"] == "SessionFailed":
-                            self.ws_pool.release(dev["device_id"], conn)
+                            self.ws_pool.release(cur_did, cur_token, conn)
                             conn = None
                             time.sleep(0.35 * (attempt + 1))
                             last_err = RuntimeError(f"StartSession: {r['status_code']} {r['status_message']}")
@@ -881,7 +916,7 @@ class DoubaoTransport:
                         if _consume_pb(raw_msg):
                             break
 
-                    self.ws_pool.release(dev["device_id"], conn)
+                    self.ws_pool.release(cur_did, cur_token, conn)
                     merged = dict(interims)
                     merged.update(finals)
                     text = "".join(merged[k] for k in sorted(merged))
@@ -898,6 +933,8 @@ class DoubaoTransport:
                     if conn is not None:
                         conn.close()
                     time.sleep(0.4 * (attempt + 1))
+        finally:
+            acquired_sem.release()
 
         if best_partial:
             return best_partial, 0.0

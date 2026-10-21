@@ -225,7 +225,7 @@ class DoubaoASR:
         max_segment_sec: float = 22.0,
         silence_rms_threshold: float = 15.0,
         split: bool = True,
-        workers: int = 4,
+        workers: int = 8,
         frame_ms: int = 10,
         bitrate: Optional[int] = None,
         complexity: Optional[int] = None,
